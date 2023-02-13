@@ -19,57 +19,79 @@ public class MyService : BackgroundService
         _wsReceiver = ws;
     }
 
+    private Queue<byte[]> _messageQueue = new Queue<byte[]>();
+
+    private void ReceiveFromSender()
+    {
+        byte[] sendBuffer = new byte[_messageSize];
+        List<byte> incomingMessage = new List<byte>();
+
+        while (true)
+        {
+            var result = _wsSender.ReceiveAsync(new ArraySegment<byte>(sendBuffer), CancellationToken.None).GetAwaiter()
+                .GetResult();
+
+            incomingMessage.AddRange(sendBuffer);
+            if (result.EndOfMessage && incomingMessage.Count > 0)
+            {
+                _messageQueue.Enqueue(incomingMessage.ToArray());
+                incomingMessage.Clear();
+            }
+        }
+    }
+
+    private void SendToReceiver()
+    {
+        while (true)
+        {
+            if (_messageQueue.Count > 0)
+            {
+                byte[] ba = _messageQueue.Dequeue();
+
+                byte[] sendBuffer = new byte[_messageSize];
+                using (var ms = new MemoryStream(ba, false))
+                {
+                    for (int i = 0; ba.Length > _messageSize * i; i++)
+                    {
+                        ms.ReadAsync(sendBuffer, 0, _messageSize).GetAwaiter().GetResult();
+
+                        var lastMessage = ba.Length <= _messageSize * (i + 1);
+                        _wsReceiver.SendAsync(new ArraySegment<byte>(sendBuffer),
+                            WebSocketMessageType.Binary, lastMessage,
+                            CancellationToken.None).GetAwaiter().GetResult();
+                    }
+                }
+            }
+            else
+                Task.Delay(500).GetAwaiter().GetResult();
+        }
+    }
+
+    private Thread _tReceive;
+    private Thread _tSend;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        Queue<byte[]> messageQueue = new Queue<byte[]>();
         while (true)
         {
             if (_wsSender != null && _wsReceiver != null)
             {
-                List<byte> incomingMessage = new List<byte>();
+                if (_tReceive != null && _tReceive.IsAlive)
+                    _tReceive.Interrupt();
+                if (_tSend != null && _tSend.IsAlive)
+                    _tSend.Interrupt();
+                
+                _tReceive = new Thread(ReceiveFromSender);
+                _tSend = new Thread(SendToReceiver);
 
-                Task.Run(() =>
+                _tReceive.Start();
+                _tSend.Start();
+
+                while (_tReceive.IsAlive && _tSend.IsAlive)
                 {
-                    byte[] sendBuffer = new byte[_messageSize];
-                    while (true)
-                    {
-                        var result = _wsSender.ReceiveAsync(new ArraySegment<byte>(sendBuffer), stoppingToken).GetAwaiter().GetResult();
-
-                        incomingMessage.AddRange(sendBuffer);
-                        if (result.EndOfMessage)
-                        {
-                            messageQueue.Enqueue(incomingMessage.ToArray());
-                            incomingMessage.Clear();
-                        }
-                    }
-                });
-
-                await Task.Run(async () =>
-                {
-                    while (true)
-                    {
-                        if (messageQueue.Count > 0)
-                        {
-                            byte[] ba = messageQueue.Dequeue();
-
-                            byte[] sendBuffer = new byte[_messageSize];
-                            using (var ms = new MemoryStream(ba, false))
-                            {
-                                for (int i = 0; ba.Length > _messageSize * i; i++)
-                                {
-                                    await ms.ReadAsync(sendBuffer, 0, _messageSize);
-
-                                    var lastMessage = ba.Length <= _messageSize * (i + 1);
-                                    await _wsReceiver.SendAsync(new ArraySegment<byte>(sendBuffer),
-                                        WebSocketMessageType.Binary, lastMessage,
-                                        CancellationToken.None);
-                                }
-                            }
-                        }
-                        else
-                            await Task.Delay(500);
-                    }
-                });
+                    await Task.Delay(1000);
+                    Console.WriteLine("Running!");
+                }
             }
             else
             {
